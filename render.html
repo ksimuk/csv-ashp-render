@@ -1,0 +1,178 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>EEV Log Viewer</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/PapaParse/5.4.1/papaparse.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/plotly.js-dist-min@2.35.2/plotly.min.js"></script>
+<style>
+  :root {
+    --page: #f9f9f7; --surface: #fcfcfb; --ink: #0b0b0b; --muted: #898781;
+    --grid: #e1e0d9; --accent: #2a78d6; --warn: #c4314b;
+    color-scheme: light;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --page: #141413; --surface: #1c1c1b; --ink: #f2f1ec; --muted: #9a988f;
+            --grid: #33322f; --accent: #5b9bea; --warn: #f0707f; color-scheme: dark; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; padding: 20px 16px; background: var(--page); color: var(--ink);
+         font: 14px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  h1 { font-size: 18px; margin: 0 0 12px; font-weight: 600; }
+  #drop { display: block; border: 2px dashed var(--grid); border-radius: 8px; padding: 18px; text-align: center;
+          background: var(--surface); cursor: pointer; transition: border-color .15s; }
+  #drop.over { border-color: var(--accent); }
+  #drop input { display: none; }
+  #drop b { color: var(--accent); }
+  #status { margin: 10px 0; color: var(--muted); white-space: pre-line; }
+  #status .err { color: var(--warn); }
+  #chart { width: 100%; height: 1300px; }
+  [hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<h1>EEV, DSH, Subcool, Compressor/Fan Speed and Suction Superheat</h1>
+
+<label id="drop">
+  <input id="files" type="file" accept=".csv,text/csv" multiple>
+  Drop CSV files here or <b>click to choose</b> (multiple files are merged and sorted by time)
+</label>
+<div id="status"></div>
+<div id="chart" hidden></div>
+
+<script>
+const REQUIRED = [
+  'Time', 'Actual Superheat Steps', 'T4 Condenser Out', 'T8 Compressor Discharge',
+  'TP2 High Pressure as Temperature', 'Target Discharge Superheat', 'Actual Compressor Speed',
+  'Actual Fan Speed', 'T1 Evap Out', 'TP1 Low Pressure as Temperature'
+];
+
+// Categorical palette slots (validated for colorblind-safe adjacency)
+const C = {
+  eev: '#2a78d6', dsh: '#eb6834', target: '#1baf7a', subcool: '#eda100',
+  comp: '#e87ba4', fan: '#008300', suction: '#c4314b'
+};
+
+const drop = document.getElementById('drop');
+const input = document.getElementById('files');
+const statusEl = document.getElementById('status');
+const chartEl = document.getElementById('chart');
+
+input.addEventListener('change', () => handleFiles(input.files));
+['dragenter', 'dragover'].forEach(e => drop.addEventListener(e, ev => {
+  ev.preventDefault(); drop.classList.add('over');
+}));
+['dragleave', 'drop'].forEach(e => drop.addEventListener(e, ev => {
+  ev.preventDefault(); drop.classList.remove('over');
+}));
+drop.addEventListener('drop', ev => handleFiles(ev.dataTransfer.files));
+
+function parseFile(file) {
+  return new Promise(resolve => {
+    Papa.parse(file, {
+      header: true, dynamicTyping: true, skipEmptyLines: true,
+      complete: res => resolve({ file, res }),
+      error: err => resolve({ file, err })
+    });
+  });
+}
+
+async function handleFiles(fileList) {
+  const files = [...fileList].filter(f => /\.csv$/i.test(f.name));
+  if (!files.length) return;
+  statusEl.textContent = `Reading ${files.length} file(s)…`;
+
+  const msgs = [];
+  let rows = [];
+  for (const { file, res, err } of await Promise.all(files.map(parseFile))) {
+    if (err) { msgs.push(`<span class="err">Error processing '${file.name}': ${err.message}</span>`); continue; }
+    const missing = REQUIRED.filter(c => !res.meta.fields.includes(c));
+    if (missing.length) {
+      msgs.push(`<span class="err">Missing columns [${missing.join(', ')}] in '${file.name}'. Skipped.</span>`);
+      continue;
+    }
+    rows = rows.concat(res.data);
+    msgs.push(`${file.name}: ${res.data.length} rows`);
+  }
+
+  if (!rows.length) {
+    statusEl.innerHTML = msgs.join('\n') + '\n<span class="err">No valid data found to plot.</span>';
+    chartEl.hidden = true;
+    return;
+  }
+
+  rows.forEach(r => { r._t = new Date(r.Time); });
+  rows = rows.filter(r => !isNaN(r._t)).sort((a, b) => a._t - b._t);
+  statusEl.innerHTML = msgs.join('\n') + `\nTotal: ${rows.length} rows, ${fmtTime(rows[0]._t)} → ${fmtTime(rows[rows.length - 1]._t)}`;
+  render(rows);
+}
+
+function fmtTime(d) {
+  const p = n => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+}
+
+function render(rows) {
+  const col = k => rows.map(r => r[k]);
+  const diff = (a, b) => rows.map(r => (r[a] == null || r[b] == null) ? null : +(r[a] - r[b]).toFixed(2));
+  // Plotly treats ISO strings with offsets inconsistently, so pass local-time strings
+  const x = rows.map(r => fmtTime(r._t));
+
+  const line = (y, name, color, axis, fmt, unit, dash) => ({
+    x, y, name, type: 'scattergl', mode: 'lines', xaxis: 'x', yaxis: axis,
+    line: { color, width: 2, dash: dash || 'solid' },
+    hovertemplate: `%{y:${fmt}}${unit}<extra>${name}</extra>`
+  });
+
+  const traces = [
+    line(col('Actual Superheat Steps'), 'EEV (Steps)', C.eev, 'y', '.0f', ' steps'),
+    line(diff('T8 Compressor Discharge', 'TP2 High Pressure as Temperature'), 'Actual DSH', C.dsh, 'y2', '.1f', ' °C'),
+    line(col('Target Discharge Superheat'), 'Target DSH', C.target, 'y2', '.1f', ' °C', 'dash'),
+    line(diff('T4 Condenser Out', 'TP2 High Pressure as Temperature'), 'Subcool (T4-Thp)', C.subcool, 'y2', '.1f', ' °C'),
+    line(col('Actual Compressor Speed'), 'Compressor Speed', C.comp, 'y3', '.0f', ''),
+    line(col('Actual Fan Speed'), 'Fan Speed', C.fan, 'y3', '.0f', ''),
+    line(diff('T1 Evap Out', 'TP1 Low Pressure as Temperature'), 'Suction SH (T1-Tlp)', C.suction, 'y4', '.1f', ' °C'),
+  ];
+
+  const css = getComputedStyle(document.documentElement);
+  const v = n => css.getPropertyValue(n).trim();
+  const grid = v('--grid'), muted = v('--muted');
+
+  // Four stacked panels sharing a time axis (no dual y-axes); weights 0.2/0.4/0.2/0.2
+  const gap = 0.05, h = 1 - 3 * gap;
+  const weights = [0.2, 0.4, 0.2, 0.2];
+  let top = 1;
+  const domains = weights.map(w => { const d = [top - w * h, top]; top = d[0] - gap; return d; });
+  const titles = ['EEV (Steps)', 'Temperature (°C)', 'Compressor & Fan Speed', 'Suction Superheat (T1-Tlp)'];
+  const yTitles = ['Steps', 'Temperature (°C)', 'Speed', 'Superheat (°C)'];
+
+  const yaxis = i => ({
+    domain: domains[i], title: { text: yTitles[i] }, showgrid: true, gridcolor: grid,
+    zeroline: false, linecolor: grid
+  });
+
+  const layout = {
+    hovermode: 'x unified',
+    plot_bgcolor: v('--surface'), paper_bgcolor: v('--page'),
+    font: { family: 'system-ui, -apple-system, "Segoe UI", sans-serif', color: v('--ink') },
+    legend: { orientation: 'h', yanchor: 'bottom', y: 1.02, xanchor: 'left', x: 0 },
+    margin: { t: 60, l: 70, r: 20, b: 50 },
+    xaxis: {
+      anchor: 'y4', title: { text: 'Time' }, showgrid: true, gridcolor: grid, linecolor: grid,
+      showspikes: true, spikemode: 'across', spikesnap: 'cursor',
+      spikethickness: 1, spikedash: 'dot', spikecolor: muted
+    },
+    yaxis: yaxis(0), yaxis2: yaxis(1), yaxis3: yaxis(2), yaxis4: yaxis(3),
+    annotations: titles.map((t, i) => ({
+      text: t, showarrow: false, xref: 'paper', yref: 'paper', x: 0, y: domains[i][1],
+      xanchor: 'left', yanchor: 'bottom', font: { size: 13 }
+    }))
+  };
+
+  chartEl.hidden = false;
+  Plotly.newPlot(chartEl, traces, layout, { responsive: true, displaylogo: false });
+}
+</script>
+</body>
+</html>
