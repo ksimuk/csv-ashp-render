@@ -12,10 +12,11 @@ COLOR_TARGET_DSH = '#1baf7a'  # slot 3 aqua
 COLOR_SUBCOOL = '#eda100'     # slot 4 yellow
 COLOR_COMPRESSOR = '#e87ba4'  # slot 5 magenta
 COLOR_FAN = '#008300'         # slot 6 green
-COLOR_SUCTION_SH = '#c4314b'  # slot 7 red
 COLOR_LOW_PRESSURE = '#7b5cd6'  # slot 8 violet
-# Palette slots are exhausted; the single-series evaporator delta panel uses neutral ink
+# The single-series evaporator delta panel uses neutral ink
 COLOR_EVAP_DELTA = '#52514e'
+# T1/T2 are an in/out pair: one hue, distinguished by solid vs dotted stroke
+COLOR_EVAP_TEMP = '#8a5a2b'
 
 SURFACE = '#fcfcfb'
 PAGE_PLANE = '#f9f9f7'
@@ -27,7 +28,7 @@ GRIDLINE = '#e1e0d9'
 def visualize_over_time(file_list, output_path='visualization.html', open_browser=True):
     """
     Reads CSV files, concatenates them, calculates Actual DSH, Subcool
-    and Suction Superheat temperatures, and writes an interactive HTML chart with hover tooltips.
+    and Evaporator Delta temperatures, and writes an interactive HTML chart with hover tooltips.
     """
     dataframes = []
 
@@ -79,16 +80,15 @@ def visualize_over_time(file_list, output_path='visualization.html', open_browse
     # Calculate Actual DSH and Subcool temperature (T4 - Thp)
     combined_df['Actual DSH'] = combined_df['T8 Compressor Discharge'] - combined_df['TP2 High Pressure as Temperature']
     combined_df['Subcool'] = combined_df['T4 Condenser Out'] - combined_df['TP2 High Pressure as Temperature']
-    combined_df['Suction SH'] = combined_df['T1 Evap Out'] - combined_df['TP1 Low Pressure as Temperature']
     combined_df['Evap Delta'] = combined_df['T1 Evap Out'] - combined_df['T2 Evap In']
 
-    # 3. Plotting - five stacked panels sharing a time axis (no dual y-axes)
+    # 3. Plotting - four stacked panels sharing a time axis (no dual y-axes)
     fig = make_subplots(
-        rows=5, cols=1,
+        rows=4, cols=1,
         shared_xaxes=True,
-        row_heights=[0.17, 0.33, 0.17, 0.17, 0.16],
+        row_heights=[0.2, 0.4, 0.2, 0.2],
         vertical_spacing=0.05,
-        subplot_titles=('EEV (Steps)', 'Temperature (°C)', 'Compressor & Fan Speed', 'Suction Superheat (T1-Tlp)', 'Evaporator Delta (T1-T2)')
+        subplot_titles=('EEV (Steps)', 'Temperature (°C)', 'Compressor & Fan Speed', 'Evaporator Delta (T1-T2)')
     )
 
     fig.add_trace(go.Scatter(
@@ -127,6 +127,20 @@ def visualize_over_time(file_list, output_path='visualization.html', open_browse
     ), row=2, col=1)
 
     fig.add_trace(go.Scatter(
+        x=combined_df['Time'], y=combined_df['T1 Evap Out'],
+        name='T1 Evap Out', mode='lines',
+        line=dict(color=COLOR_EVAP_TEMP, width=2),
+        hovertemplate='%{y:.1f} °C<extra>T1 Evap Out</extra>'
+    ), row=2, col=1)
+
+    fig.add_trace(go.Scatter(
+        x=combined_df['Time'], y=combined_df['T2 Evap In'],
+        name='T2 Evap In', mode='lines',
+        line=dict(color=COLOR_EVAP_TEMP, width=2, dash='dot'),
+        hovertemplate='%{y:.1f} °C<extra>T2 Evap In</extra>'
+    ), row=2, col=1)
+
+    fig.add_trace(go.Scatter(
         x=combined_df['Time'], y=combined_df['Actual Compressor Speed'],
         name='Compressor Speed', mode='lines',
         line=dict(color=COLOR_COMPRESSOR, width=2),
@@ -141,21 +155,14 @@ def visualize_over_time(file_list, output_path='visualization.html', open_browse
     ), row=3, col=1)
 
     fig.add_trace(go.Scatter(
-        x=combined_df['Time'], y=combined_df['Suction SH'],
-        name='Suction SH (T1-Tlp)', mode='lines',
-        line=dict(color=COLOR_SUCTION_SH, width=2),
-        hovertemplate='%{y:.1f} °C<extra>Suction SH (T1-Tlp)</extra>'
-    ), row=4, col=1)
-
-    fig.add_trace(go.Scatter(
         x=combined_df['Time'], y=combined_df['Evap Delta'],
         name='Evap Delta (T1-T2)', mode='lines',
         line=dict(color=COLOR_EVAP_DELTA, width=2),
         hovertemplate='%{y:.1f} °C<extra>Evap Delta (T1-T2)</extra>'
-    ), row=5, col=1)
+    ), row=4, col=1)
 
     fig.add_hline(
-        y=0.3, row=5, col=1,
+        y=0.3, row=4, col=1,
         line=dict(color=INK_MUTED, width=1, dash='dot'),
         annotation_text='0.3 K', annotation_position='top left',
         annotation_font_color=INK_MUTED
@@ -171,18 +178,17 @@ def visualize_over_time(file_list, output_path='visualization.html', open_browse
     fig.update_yaxes(title_text='Steps', row=1, col=1)
     fig.update_yaxes(title_text='Temperature (°C)', row=2, col=1)
     fig.update_yaxes(title_text='Speed', row=3, col=1)
-    fig.update_yaxes(title_text='Superheat (°C)', row=4, col=1)
-    fig.update_yaxes(title_text='Delta (°C)', row=5, col=1)
-    fig.update_xaxes(title_text='Time', row=5, col=1)
+    fig.update_yaxes(title_text='Delta (°C)', row=4, col=1)
+    fig.update_xaxes(title_text='Time', row=4, col=1)
 
     fig.update_layout(
         hovermode='x unified',
-        title='EEV, DSH, Subcool, Compressor/Fan Speed, Suction Superheat and Evaporator Delta Over Time',
+        title='EEV, DSH, Subcool, Compressor/Fan Speed and Evaporator Delta Over Time',
         plot_bgcolor=SURFACE,
         paper_bgcolor=PAGE_PLANE,
         font=dict(family='system-ui, -apple-system, "Segoe UI", sans-serif', color=INK_PRIMARY),
         legend=dict(orientation='h', yanchor='bottom', y=1.06, xanchor='left', x=0),
-        height=1550,
+        height=1250,
         margin=dict(t=110),
     )
 
