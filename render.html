@@ -8,12 +8,12 @@
 <script src="https://cdn.jsdelivr.net/npm/plotly.js-dist-min@2.35.2/plotly.min.js"></script>
 <style>
   :root {
-    --page: #f9f9f7; --surface: #fcfcfb; --ink: #0b0b0b; --muted: #898781;
+    --page: #f9f9f7; --surface: #fcfcfb; --ink: #0b0b0b; --ink2: #52514e; --muted: #898781;
     --grid: #e1e0d9; --accent: #2a78d6; --warn: #c4314b;
     color-scheme: light;
   }
   @media (prefers-color-scheme: dark) {
-    :root { --page: #141413; --surface: #1c1c1b; --ink: #f2f1ec; --muted: #9a988f;
+    :root { --page: #141413; --surface: #1c1c1b; --ink: #f2f1ec; --ink2: #c3c2b7; --muted: #9a988f;
             --grid: #33322f; --accent: #5b9bea; --warn: #f0707f; color-scheme: dark; }
   }
   * { box-sizing: border-box; }
@@ -27,36 +27,168 @@
   #drop b { color: var(--accent); }
   #status { margin: 10px 0; color: var(--muted); white-space: pre-line; }
   #status .err { color: var(--warn); }
-  #chart { width: 100%; height: 1300px; }
-  [hidden] { display: none !important; }
+  #controls { display: flex; flex-wrap: wrap; gap: 6px 18px; margin: 4px 0 8px; }
+  #controls fieldset { border: 0; padding: 0; margin: 0; display: flex; flex-wrap: wrap; gap: 4px 14px; }
+  #controls legend { color: var(--muted); font-size: 12px; padding: 0; margin-bottom: 2px; }
+  #controls label { display: inline-flex; align-items: center; gap: 5px; cursor: pointer; white-space: nowrap; }
+  #controls label.na { color: var(--muted); cursor: not-allowed; }
+  #controls label small { color: var(--muted); }
+  #statekey { display: flex; flex-wrap: wrap; gap: 4px 16px; margin: 0 0 6px; color: var(--ink2); font-size: 12px; }
+  #statekey span.sw { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 4px;
+                      vertical-align: -1px; }
+  #statekey b { font-weight: 600; margin-right: 6px; }
+  #chart { width: 100%; }
 </style>
 </head>
 <body>
-<h1>EEV, DSH, Subcool, Compressor/Fan Speed and Suction Superheat</h1>
+<h1>ASHP log viewer: EEV, refrigerant circuit, water side</h1>
 
 <label id="drop">
   <input id="files" type="file" accept=".csv,text/csv" multiple>
   Drop CSV files here or <b>click to choose</b> (multiple files are merged and sorted by time)
 </label>
 <div id="status"></div>
+<div id="controls" hidden></div>
+<div id="statekey" hidden></div>
 <div id="chart" hidden></div>
 
 <script>
-const REQUIRED = [
-  'Time', 'Actual Superheat Steps', 'T4 Condenser Out', 'T8 Compressor Discharge',
-  'TP2 High Pressure as Temperature', 'Target Discharge Superheat', 'Actual Compressor Speed',
-  'Actual Fan Speed', 'T1 Evap Out', 'TP1 Low Pressure as Temperature'
+const DARK = matchMedia('(prefers-color-scheme: dark)');
+
+// Categorical palette slots, light and dark steps (validated for colorblind-safe adjacency)
+const PALETTE = {
+  light: { blue: '#2a78d6', orange: '#eb6834', aqua: '#1baf7a', yellow: '#eda100', magenta: '#e87ba4',
+           green: '#008300', violet: '#7b5cd6', red: '#e34948', brown: '#8a5a2b', neutral: '#52514e',
+           off: '#e1e0d9' },
+  dark:  { blue: '#3987e5', orange: '#d95926', aqua: '#199e70', yellow: '#c98500', magenta: '#d55181',
+           green: '#008300', violet: '#9085e9', red: '#e66767', brown: '#b07a45', neutral: '#c3c2b7',
+           off: '#383835' }
+};
+
+const SPECIFIC_HEAT = 4.18;  // kJ/(kg·K), water at ~40 °C, 1 L ≈ 1 kg
+const GAP_MS = 60 * 1000;    // break lines when consecutive samples are further apart than this
+
+// Derived columns, computed once per load. Each returns null when an input is missing.
+const DERIVED = {
+  'Actual DSH': r => sub(r['T8 Compressor Discharge'], r['TP2 High Pressure as Temperature']),
+  'Subcool': r => sub(r['T4 Condenser Out'], r['TP2 High Pressure as Temperature']),
+  'Evap Delta': r => sub(r['T1 Evap Out'], r['T2 Evap In']),
+  'Suction SH': r => sub(r['T1 Evap Out'], r['TP1 Low Pressure as Temperature']),
+  'Water dT': r => sub(r['T5 Water Out'], r['T6 Water In']),
+  'Heat Output': r => {
+    const dt = sub(r['T5 Water Out'], r['T6 Water In']), f = r['Water Flow'];
+    return dt == null || f == null ? null : f / 60 * SPECIFIC_HEAT * dt;
+  },
+  // The controller reports 0 when there is no demand; drop it so it doesn't flatten the axis
+  'Target Water': r => r['Target Water Temperature'] || null,
+  'P2 bar': r => r['P2 High Pressure'] == null ? null : r['P2 High Pressure'] / 100,
+  'P1 bar': r => r['P1 Low Pressure'] == null ? null : r['P1 Low Pressure'] / 100,
+  'Pressure Ratio': r => r['P1 Low Pressure'] > 0 && r['P2 High Pressure'] != null
+    ? r['P2 High Pressure'] / r['P1 Low Pressure'] : null,
+  'Condenser Approach': r => sub(r['TP2 High Pressure as Temperature'], r['T5 Water Out']),
+  'Evaporator Approach': r => sub(r['T3 External Ambient'], r['TP1 Low Pressure as Temperature']),
+};
+// Source columns each derived value needs, used to grey out unavailable panels
+const DERIVED_NEEDS = {
+  'Actual DSH': ['T8 Compressor Discharge', 'TP2 High Pressure as Temperature'],
+  'Subcool': ['T4 Condenser Out', 'TP2 High Pressure as Temperature'],
+  'Evap Delta': ['T1 Evap Out', 'T2 Evap In'],
+  'Suction SH': ['T1 Evap Out', 'TP1 Low Pressure as Temperature'],
+  'Water dT': ['T5 Water Out', 'T6 Water In'],
+  'Heat Output': ['T5 Water Out', 'T6 Water In', 'Water Flow'],
+  'Target Water': ['Target Water Temperature'],
+  'P2 bar': ['P2 High Pressure'],
+  'P1 bar': ['P1 Low Pressure'],
+  'Pressure Ratio': ['P2 High Pressure', 'P1 Low Pressure'],
+  'Condenser Approach': ['TP2 High Pressure as Temperature', 'T5 Water Out'],
+  'Evaporator Approach': ['T3 External Ambient', 'TP1 Low Pressure as Temperature'],
+};
+function sub(a, b) { return a == null || b == null ? null : +(a - b).toFixed(2); }
+
+// s(column, label, colorKey, format, unit, dash)
+const s = (key, name, color, fmt, unit, dash) => ({ key, name, color, fmt, unit, dash });
+
+// Panels in display order. `h` is the plot height in px; `on` is the default selection.
+const PANELS = [
+  { id: 'state', group: 'Context', label: 'Operating state', h: 90, on: true, kind: 'state',
+    title: 'Operating state', rows: [
+      { key: 'Operating state', name: 'Unit', colors: { Running: 'green', Startup: 'yellow', CompressorResting: 'blue',
+        Shutdown: 'orange', Idle: 'off', Manual: 'violet' } },
+      { key: 'Indoor state', name: 'Mode', colors: { Heating: 'orange', DHWHeating: 'magenta', CompressorResting: 'blue',
+        PendingShutdown: 'yellow', ShuttingDown: 'yellow', Idle: 'off' } },
+      { key: 'Water pump', name: 'Pump', colors: { 1: 'aqua', 0: 'off' }, names: { 1: 'On', 0: 'Off' } },
+      { key: 'Immersion heater', name: 'Immersion', colors: { on: 'red', off: 'off' } },
+      { key: 'Safety faults', name: 'Faults', colors: { 0: 'off' }, fallback: 'red', names: { 0: 'None' } },
+    ] },
+  { id: 'eev', group: 'Refrigerant', label: 'EEV steps', h: 200, on: true,
+    title: 'EEV (Steps)', yTitle: 'Steps',
+    series: [s('Actual Superheat Steps', 'EEV (Steps)', 'blue', '.0f', ' steps')] },
+  { id: 'temps', group: 'Refrigerant', label: 'DSH, subcool, evaporator temps', h: 400, on: true,
+    title: 'Refrigerant temperatures (°C)', yTitle: 'Temperature (°C)',
+    series: [
+      s('Actual DSH', 'Actual DSH', 'orange', '.1f', ' °C'),
+      s('Target Discharge Superheat', 'Target DSH', 'aqua', '.1f', ' °C', 'dash'),
+      s('Subcool', 'Subcool (T4-Thp)', 'yellow', '.1f', ' °C'),
+      s('TP1 Low Pressure as Temperature', 'Low Pressure as Temp (Tlp)', 'violet', '.1f', ' °C'),
+      s('T1 Evap Out', 'T1 Evap Out', 'brown', '.1f', ' °C'),
+      s('T2 Evap In', 'T2 Evap In', 'brown', '.1f', ' °C', 'dot'),
+    ] },
+  { id: 'speed', group: 'Refrigerant', label: 'Compressor & fan speed', h: 200, on: true,
+    title: 'Compressor & Fan Speed', yTitle: 'Speed',
+    series: [
+      s('Actual Compressor Speed', 'Compressor Speed', 'magenta', '.0f', ''),
+      s('Actual Fan Speed', 'Fan Speed', 'green', '.0f', ''),
+    ] },
+  { id: 'evapdelta', group: 'Refrigerant', label: 'Evaporator delta (T1-T2)', h: 200, on: true,
+    title: 'Evaporator Delta (T1-T2)', yTitle: 'Delta (°C)', hline: { y: 0.3, text: '0.3 K' },
+    series: [s('Evap Delta', 'Evap Delta (T1-T2)', 'neutral', '.1f', ' °C')] },
+  { id: 'pressure', group: 'Refrigerant', label: 'High & low pressure', h: 240, on: true,
+    title: 'Refrigerant pressure (bar abs)', yTitle: 'Pressure (bar)',
+    series: [
+      s('P2 bar', 'High pressure (P2)', 'orange', '.2f', ' bar'),
+      s('P1 bar', 'Low pressure (P1)', 'blue', '.2f', ' bar'),
+    ] },
+  { id: 'ratio', group: 'Refrigerant', label: 'Pressure ratio', hint: 'P2/P1', h: 180, on: false,
+    title: 'Compression ratio (P2/P1)', yTitle: 'Ratio',
+    series: [s('Pressure Ratio', 'Pressure ratio (P2/P1)', 'violet', '.2f', '')] },
+  { id: 'approach', group: 'Refrigerant', label: 'Heat-exchanger approach', h: 200, on: false,
+    title: 'Approach temperatures (K)', yTitle: 'Approach (K)',
+    series: [
+      s('Condenser Approach', 'Condenser approach (Thp-Flow)', 'orange', '.1f', ' K'),
+      s('Evaporator Approach', 'Evaporator approach (Ambient-Tlp)', 'blue', '.1f', ' K'),
+    ] },
+  { id: 'ssh', group: 'Refrigerant', label: 'Suction superheat', hint: 'T1-Tlp', h: 200, on: false,
+    title: 'Suction Superheat (T1-Tlp)', yTitle: 'Superheat (°C)',
+    series: [s('Suction SH', 'Suction SH (T1-Tlp)', 'red', '.1f', ' °C')] },
+  { id: 'water', group: 'Water side', label: 'Flow / return / target', h: 320, on: true,
+    title: 'Water temperatures (°C)', yTitle: 'Temperature (°C)',
+    series: [
+      s('T5 Water Out', 'Flow (T5)', 'orange', '.1f', ' °C'),
+      s('T6 Water In', 'Return (T6)', 'blue', '.1f', ' °C'),
+      s('Target Water', 'Target', 'neutral', '.1f', ' °C', 'dash'),
+      s('T2 DHW', 'DHW tank (T2)', 'aqua', '.1f', ' °C', 'dot'),
+    ] },
+  { id: 'heat', group: 'Water side', label: 'Heat output', hint: 'flow × ΔT', h: 220, on: false,
+    title: 'Heat output (kW, from water flow × flow-return ΔT)', yTitle: 'kW',
+    series: [{ ...s('Heat Output', 'Heat output', 'orange', '.2f', ' kW'), extra: ['Water dT', 'Water Flow'],
+               hover: '%{y:.2f} kW · ΔT %{customdata[0]:.1f} K · %{customdata[1]:.1f} L/min' }] },
+  { id: 'flow', group: 'Water side', label: 'Water flow rate', h: 180, on: false,
+    title: 'Water flow (L/min)', yTitle: 'L/min',
+    series: [s('Water Flow', 'Water flow', 'blue', '.1f', ' L/min')] },
+  { id: 'ambient', group: 'Water side', label: 'Outdoor ambient', hint: 'T3', h: 180, on: false,
+    title: 'Outdoor ambient (T3, °C)', yTitle: '°C',
+    series: [s('T3 External Ambient', 'Outdoor ambient (T3)', 'aqua', '.1f', ' °C')] },
 ];
 
-// Categorical palette slots (validated for colorblind-safe adjacency)
-const C = {
-  eev: '#2a78d6', dsh: '#eb6834', target: '#1baf7a', subcool: '#eda100',
-  comp: '#e87ba4', fan: '#008300', suction: '#c4314b'
-};
+const STORE_KEY = 'ashp-log-viewer:panels';
+const selected = loadSelection();
+let ROWS = null, AVAILABLE = new Set();
 
 const drop = document.getElementById('drop');
 const input = document.getElementById('files');
 const statusEl = document.getElementById('status');
+const controlsEl = document.getElementById('controls');
+const keyEl = document.getElementById('statekey');
 const chartEl = document.getElementById('chart');
 
 input.addEventListener('change', () => handleFiles(input.files));
@@ -67,6 +199,16 @@ input.addEventListener('change', () => handleFiles(input.files));
   ev.preventDefault(); drop.classList.remove('over');
 }));
 drop.addEventListener('drop', ev => handleFiles(ev.dataTransfer.files));
+DARK.addEventListener('change', () => ROWS && render());
+
+function loadSelection() {
+  let saved = {};
+  try { saved = JSON.parse(localStorage.getItem(STORE_KEY)) || {}; } catch (e) {}
+  return Object.fromEntries(PANELS.map(p => [p.id, p.id in saved ? !!saved[p.id] : p.on]));
+}
+function saveSelection() {
+  try { localStorage.setItem(STORE_KEY, JSON.stringify(selected)); } catch (e) {}
+}
 
 function parseFile(file) {
   return new Promise(resolve => {
@@ -85,27 +227,73 @@ async function handleFiles(fileList) {
 
   const msgs = [];
   let rows = [];
+  const fields = new Set();
   for (const { file, res, err } of await Promise.all(files.map(parseFile))) {
     if (err) { msgs.push(`<span class="err">Error processing '${file.name}': ${err.message}</span>`); continue; }
-    const missing = REQUIRED.filter(c => !res.meta.fields.includes(c));
-    if (missing.length) {
-      msgs.push(`<span class="err">Missing columns [${missing.join(', ')}] in '${file.name}'. Skipped.</span>`);
+    if (!res.meta.fields.includes('Time')) {
+      msgs.push(`<span class="err">No 'Time' column in '${file.name}'. Skipped.</span>`);
       continue;
     }
+    res.meta.fields.forEach(f => fields.add(f));
     rows = rows.concat(res.data);
     msgs.push(`${file.name}: ${res.data.length} rows`);
   }
 
   if (!rows.length) {
     statusEl.innerHTML = msgs.join('\n') + '\n<span class="err">No valid data found to plot.</span>';
-    chartEl.hidden = true;
+    chartEl.hidden = controlsEl.hidden = keyEl.hidden = true;
     return;
   }
 
   rows.forEach(r => { r._t = new Date(r.Time); });
   rows = rows.filter(r => !isNaN(r._t)).sort((a, b) => a._t - b._t);
-  statusEl.innerHTML = msgs.join('\n') + `\nTotal: ${rows.length} rows, ${fmtTime(rows[0]._t)} → ${fmtTime(rows[rows.length - 1]._t)}`;
-  render(rows);
+
+  // Columns present in every file are guaranteed; others may be partially present
+  AVAILABLE = new Set(fields);
+  for (const [k, needs] of Object.entries(DERIVED_NEEDS)) if (needs.every(n => fields.has(n))) AVAILABLE.add(k);
+  rows.forEach(r => { for (const k in DERIVED) r[k] = DERIVED[k](r); });
+
+  // Insert an empty row into gaps (e.g. between log files) so lines and state bands don't bridge them
+  ROWS = [];
+  rows.forEach((r, i) => {
+    if (i && r._t - rows[i - 1]._t > GAP_MS) {
+      // Two empty rows, one at each edge, so heatmap cells don't stretch across the gap either
+      ROWS.push({ _t: new Date(+rows[i - 1]._t + 1000), _gap: true }, { _t: new Date(+r._t - 1000), _gap: true });
+    }
+    ROWS.push(r);
+  });
+
+  statusEl.innerHTML = msgs.join('\n') +
+    `\nTotal: ${rows.length} rows, ${fmtTime(rows[0]._t)} → ${fmtTime(rows[rows.length - 1]._t)}`;
+  buildControls();
+  render();
+}
+
+function panelAvailable(p) {
+  const keys = p.kind === 'state' ? p.rows.map(r => r.key) : p.series.map(x => x.key);
+  return keys.some(k => AVAILABLE.has(k));
+}
+
+function buildControls() {
+  controlsEl.innerHTML = '';
+  const groups = [...new Set(PANELS.map(p => p.group))];
+  for (const g of groups) {
+    const fs = document.createElement('fieldset');
+    fs.innerHTML = `<legend>${g}</legend>`;
+    for (const p of PANELS.filter(p => p.group === g)) {
+      const ok = panelAvailable(p);
+      const lab = document.createElement('label');
+      if (!ok) { lab.className = 'na'; lab.title = 'Columns not present in the loaded files'; }
+      const cb = document.createElement('input');
+      cb.type = 'checkbox'; cb.checked = ok && selected[p.id]; cb.disabled = !ok;
+      cb.addEventListener('change', () => { selected[p.id] = cb.checked; saveSelection(); render(); });
+      lab.append(cb, p.label);
+      if (p.hint) lab.insertAdjacentHTML('beforeend', ` <small>${p.hint}</small>`);
+      fs.append(lab);
+    }
+    controlsEl.append(fs);
+  }
+  controlsEl.hidden = false;
 }
 
 function fmtTime(d) {
@@ -113,65 +301,131 @@ function fmtTime(d) {
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
 }
 
-function render(rows) {
-  const col = k => rows.map(r => r[k]);
-  const diff = (a, b) => rows.map(r => (r[a] == null || r[b] == null) ? null : +(r[a] - r[b]).toFixed(2));
-  // Plotly treats ISO strings with offsets inconsistently, so pass local-time strings
-  const x = rows.map(r => fmtTime(r._t));
-
-  const line = (y, name, color, axis, fmt, unit, dash) => ({
-    x, y, name, type: 'scattergl', mode: 'lines', xaxis: 'x', yaxis: axis,
-    line: { color, width: 2, dash: dash || 'solid' },
-    hovertemplate: `%{y:${fmt}}${unit}<extra>${name}</extra>`
-  });
-
-  const traces = [
-    line(col('Actual Superheat Steps'), 'EEV (Steps)', C.eev, 'y', '.0f', ' steps'),
-    line(diff('T8 Compressor Discharge', 'TP2 High Pressure as Temperature'), 'Actual DSH', C.dsh, 'y2', '.1f', ' °C'),
-    line(col('Target Discharge Superheat'), 'Target DSH', C.target, 'y2', '.1f', ' °C', 'dash'),
-    line(diff('T4 Condenser Out', 'TP2 High Pressure as Temperature'), 'Subcool (T4-Thp)', C.subcool, 'y2', '.1f', ' °C'),
-    line(col('Actual Compressor Speed'), 'Compressor Speed', C.comp, 'y3', '.0f', ''),
-    line(col('Actual Fan Speed'), 'Fan Speed', C.fan, 'y3', '.0f', ''),
-    line(diff('T1 Evap Out', 'TP1 Low Pressure as Temperature'), 'Suction SH (T1-Tlp)', C.suction, 'y4', '.1f', ' °C'),
-  ];
-
+function render() {
+  const rows = ROWS;
+  const pal = DARK.matches ? PALETTE.dark : PALETTE.light;
   const css = getComputedStyle(document.documentElement);
   const v = n => css.getPropertyValue(n).trim();
   const grid = v('--grid'), muted = v('--muted');
 
-  // Four stacked panels sharing a time axis (no dual y-axes); weights 0.2/0.4/0.2/0.2
-  const gap = 0.05, h = 1 - 3 * gap;
-  const weights = [0.2, 0.4, 0.2, 0.2];
-  let top = 1;
-  const domains = weights.map(w => { const d = [top - w * h, top]; top = d[0] - gap; return d; });
-  const titles = ['EEV (Steps)', 'Temperature (°C)', 'Compressor & Fan Speed', 'Suction Superheat (T1-Tlp)'];
-  const yTitles = ['Steps', 'Temperature (°C)', 'Speed', 'Superheat (°C)'];
+  const panels = PANELS.filter(p => selected[p.id] && panelAvailable(p));
+  if (!panels.length) {
+    Plotly.purge(chartEl); chartEl.hidden = true; keyEl.hidden = true;
+    return;
+  }
 
-  const yaxis = i => ({
-    domain: domains[i], title: { text: yTitles[i] }, showgrid: true, gridcolor: grid,
-    zeroline: false, linecolor: grid
-  });
+  // Plotly treats ISO strings with offsets inconsistently, so pass local-time strings
+  const x = rows.map(r => fmtTime(r._t));
+  const col = k => rows.map(r => r[k] ?? null);
 
+  // Stack panels top-down in pixel units, then convert to paper fractions
+  const GAP = 48, TOP = 30, BOTTOM = 50;
+  const plotH = panels.reduce((a, p) => a + p.h, 0) + GAP * (panels.length - 1);
+  let y = plotH;
+  const domains = panels.map(p => { const d = [(y - p.h) / plotH, y / plotH]; y -= p.h + GAP; return d; });
+  const axisName = i => i ? `y${i + 1}` : 'y';
+  const layoutKey = i => i ? `yaxis${i + 1}` : 'yaxis';
+
+  const traces = [], annotations = [], shapes = [];
   const layout = {
+    height: plotH + TOP + BOTTOM,
     hovermode: 'x unified',
     plot_bgcolor: v('--surface'), paper_bgcolor: v('--page'),
     font: { family: 'system-ui, -apple-system, "Segoe UI", sans-serif', color: v('--ink') },
-    legend: { orientation: 'h', yanchor: 'bottom', y: 1.02, xanchor: 'left', x: 0 },
-    margin: { t: 60, l: 70, r: 20, b: 50 },
+    margin: { t: TOP, l: 80, r: 20, b: BOTTOM },
     xaxis: {
-      anchor: 'y4', title: { text: 'Time' }, showgrid: true, gridcolor: grid, linecolor: grid,
+      anchor: axisName(panels.length - 1), title: { text: 'Time' },
+      showgrid: true, gridcolor: grid, linecolor: grid,
       showspikes: true, spikemode: 'across', spikesnap: 'cursor',
       spikethickness: 1, spikedash: 'dot', spikecolor: muted
     },
-    yaxis: yaxis(0), yaxis2: yaxis(1), yaxis3: yaxis(2), yaxis4: yaxis(3),
-    annotations: titles.map((t, i) => ({
-      text: t, showarrow: false, xref: 'paper', yref: 'paper', x: 0, y: domains[i][1],
-      xanchor: 'left', yanchor: 'bottom', font: { size: 13 }
-    }))
+    annotations, shapes
   };
 
+  const keyHtml = [];
+  panels.forEach((p, i) => {
+    const yaxis = axisName(i);
+    layout[layoutKey(i)] = {
+      domain: domains[i], title: { text: p.yTitle || '' }, showgrid: p.kind !== 'state', gridcolor: grid,
+      zeroline: false, linecolor: grid, fixedrange: p.kind === 'state'
+    };
+    // Each multi-series panel gets its own legend, right-aligned on the title line
+    const legendId = `legend${i ? i + 1 : ''}`;
+    layout[legendId] = {
+      orientation: 'h', xref: 'paper', yref: 'paper', x: 1, xanchor: 'right', y: domains[i][1],
+      yanchor: 'bottom', bgcolor: 'rgba(0,0,0,0)', font: { size: 12 }
+    };
+    annotations.push({
+      text: p.title, showarrow: false, xref: 'paper', yref: 'paper', x: 0, y: domains[i][1],
+      xanchor: 'left', yanchor: 'bottom', font: { size: 13 }
+    });
+
+    if (p.kind === 'state') {
+      // One heatmap per row at a numeric y position; Plotly can't stack heatmaps on a shared category axis
+      const stateRows = p.rows.filter(sr => AVAILABLE.has(sr.key));
+      Object.assign(layout[layoutKey(i)], {
+        range: [stateRows.length - 0.5, -0.5], tickvals: stateRows.map((_, j) => j),
+        ticktext: stateRows.map(sr => sr.name), ticks: '', showline: false
+      });
+      stateRows.forEach((sr, row) => {
+        const name = val => (sr.names && sr.names[val]) || String(val);
+        const values = [...new Set(rows.filter(r => !r._gap && r[sr.key] != null).map(r => r[sr.key]))];
+        // Known states first in their declared order, then anything unexpected
+        const known = Object.keys(sr.colors);
+        values.sort((a, b) => {
+          const ia = known.indexOf(String(a)), ib = known.indexOf(String(b));
+          return (ia < 0 ? 99 : ia) - (ib < 0 ? 99 : ib);
+        });
+        if (!values.length) return;
+        const colorOf = val => pal[sr.colors[String(val)] || sr.fallback || 'neutral'];
+        const idx = new Map(values.map((val, j) => [val, j]));
+        const n = values.length;
+        // Discrete colorscale: each category owns an equal band of [0, 1]
+        const colorscale = n === 1 ? [[0, colorOf(values[0])], [1, colorOf(values[0])]]
+          : values.flatMap((val, j) => [[j / n, colorOf(val)], [(j + 1) / n, colorOf(val)]]);
+        traces.push({
+          type: 'heatmap', x, y: [row], xaxis: 'x', yaxis,
+          z: [rows.map(r => r._gap || r[sr.key] == null ? null : idx.get(r[sr.key]))],
+          text: [rows.map(r => r._gap || r[sr.key] == null ? '' : name(r[sr.key]))],
+          zmin: -0.5, zmax: n - 0.5, colorscale, showscale: false, xgap: 0, ygap: 2,
+          hovertemplate: `%{text}<extra>${sr.name}</extra>`
+        });
+        keyHtml.push(`<div><b>${sr.name}</b>` + values.map(val =>
+          `<span><span class="sw" style="background:${colorOf(val)}"></span>${name(val)}</span>`).join(' ') + '</div>');
+      });
+      return;
+    }
+
+    for (const sr of p.series) {
+      if (!AVAILABLE.has(sr.key)) continue;
+      const t = {
+        x, y: col(sr.key), name: sr.name, type: 'scattergl', mode: 'lines', xaxis: 'x', yaxis,
+        line: { color: pal[sr.color], width: 2, dash: sr.dash || 'solid' },
+        hovertemplate: `${sr.hover || `%{y:${sr.fmt}}${sr.unit}`}<extra>${sr.name}</extra>`
+      };
+      t.legend = legendId;
+      if (sr.extra) t.customdata = rows.map(r => sr.extra.map(k => r[k] ?? null));
+      // Single-series panels are named by their title; keep the legend for multi-series comparison
+      if (p.series.length === 1) t.showlegend = false;
+      traces.push(t);
+    }
+
+    if (p.hline) {
+      shapes.push({
+        type: 'line', xref: 'paper', x0: 0, x1: 1, yref: yaxis, y0: p.hline.y, y1: p.hline.y,
+        line: { color: muted, width: 1, dash: 'dot' }
+      });
+      annotations.push({
+        text: p.hline.text, showarrow: false, xref: 'paper', x: 0, yref: yaxis, y: p.hline.y,
+        xanchor: 'left', yanchor: 'bottom', font: { color: muted, size: 11 }
+      });
+    }
+  });
+
+  keyEl.innerHTML = keyHtml.join('');
+  keyEl.hidden = !keyHtml.length;
   chartEl.hidden = false;
-  Plotly.newPlot(chartEl, traces, layout, { responsive: true, displaylogo: false });
+  Plotly.react(chartEl, traces, layout, { responsive: true, displaylogo: false });
 }
 </script>
 </body>
