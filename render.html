@@ -66,7 +66,7 @@ const PALETTE = {
 };
 
 const SPECIFIC_HEAT = 4.18;  // kJ/(kg·K), water at ~40 °C, 1 L ≈ 1 kg
-const GAP_MS = 60 * 1000;    // break lines when consecutive samples are further apart than this
+const GAP_MS = 60 * 1000;    // a jump to another file further apart than this starts a new cycle (gap collapsed, marked by a line)
 
 // Derived columns, computed once per load. Each returns null when an input is missing.
 const DERIVED = {
@@ -182,7 +182,7 @@ const PANELS = [
 
 const STORE_KEY = 'ashp-log-viewer:panels';
 const selected = loadSelection();
-let ROWS = null, AVAILABLE = new Set();
+let ROWS = null, BREAKS = [], AVAILABLE = new Set();
 
 const drop = document.getElementById('drop');
 const input = document.getElementById('files');
@@ -228,13 +228,14 @@ async function handleFiles(fileList) {
   const msgs = [];
   let rows = [];
   const fields = new Set();
-  for (const { file, res, err } of await Promise.all(files.map(parseFile))) {
+  for (const [fi, { file, res, err }] of (await Promise.all(files.map(parseFile))).entries()) {
     if (err) { msgs.push(`<span class="err">Error processing '${file.name}': ${err.message}</span>`); continue; }
     if (!res.meta.fields.includes('Time')) {
       msgs.push(`<span class="err">No 'Time' column in '${file.name}'. Skipped.</span>`);
       continue;
     }
     res.meta.fields.forEach(f => fields.add(f));
+    res.data.forEach(r => { r._f = fi; });
     rows = rows.concat(res.data);
     msgs.push(`${file.name}: ${res.data.length} rows`);
   }
@@ -253,12 +254,30 @@ async function handleFiles(fileList) {
   for (const [k, needs] of Object.entries(DERIVED_NEEDS)) if (needs.every(n => fields.has(n))) AVAILABLE.add(k);
   rows.forEach(r => { for (const k in DERIVED) r[k] = DERIVED[k](r); });
 
-  // Insert an empty row into gaps (e.g. between log files) so lines and state bands don't bridge them
-  ROWS = [];
+  // Each file's typical sample interval, used to fill pauses inside a file so its time stays true
+  const steps = new Map();
   rows.forEach((r, i) => {
-    if (i && r._t - rows[i - 1]._t > GAP_MS) {
-      // Two empty rows, one at each edge, so heatmap cells don't stretch across the gap either
-      ROWS.push({ _t: new Date(+rows[i - 1]._t + 1000), _gap: true }, { _t: new Date(+r._t - 1000), _gap: true });
+    const prev = rows[i - 1];
+    if (prev && prev._f === r._f) (steps.get(r._f) || steps.set(r._f, []).get(r._f)).push(r._t - prev._t);
+  });
+  for (const [f, d] of steps) steps.set(f, Math.max(1000, d.sort((a, b) => a - b)[d.length >> 1]));
+
+  // Idle gaps between files are collapsed and marked; pauses within a file are padded with empty rows.
+  // Padding rows (_pad) are left out of line traces so short pauses don't break lines; long ones get a null (_brk).
+  // State bands show short pauses with the previous sample (_src) and long ones as empty.
+  ROWS = []; BREAKS = [];
+  rows.forEach((r, i) => {
+    const prev = rows[i - 1], gap = prev ? r._t - prev._t : 0;
+    if (prev && prev._f !== r._f && gap > GAP_MS) {
+      BREAKS.push(ROWS.length);
+    } else if (prev) {
+      const step = steps.get(r._f) || 1000;
+      if (gap > step * 1.5) {
+        const long = gap > GAP_MS;
+        for (let t = +prev._t + step, j = 0; t < +r._t; t += step, j++) {
+          ROWS.push({ _t: new Date(t), _pad: true, _brk: long && !j, _src: long ? null : prev });
+        }
+      }
     }
     ROWS.push(r);
   });
@@ -314,9 +333,11 @@ function render() {
     return;
   }
 
-  // Plotly treats ISO strings with offsets inconsistently, so pass local-time strings
+  // A category axis gives each sample one slot, so idle time between cycles takes no space
   const x = rows.map(r => fmtTime(r._t));
-  const col = k => rows.map(r => r[k] ?? null);
+  const lineRows = rows.filter(r => !r._pad || r._brk);
+  const lineX = lineRows.map(r => fmtTime(r._t));
+  const col = k => lineRows.map(r => r[k] ?? null);
 
   // Stack panels top-down in pixel units, then convert to paper fractions
   const GAP = 48, TOP = 30, BOTTOM = 50;
@@ -334,7 +355,7 @@ function render() {
     font: { family: 'system-ui, -apple-system, "Segoe UI", sans-serif', color: v('--ink') },
     margin: { t: TOP, l: 80, r: 20, b: BOTTOM },
     xaxis: {
-      anchor: axisName(panels.length - 1), title: { text: 'Time' },
+      anchor: axisName(panels.length - 1), title: { text: 'Time' }, type: 'category', categoryorder: 'array', categoryarray: x, nticks: 8, tickangle: 0,
       showgrid: true, gridcolor: grid, linecolor: grid,
       showspikes: true, spikemode: 'across', spikesnap: 'cursor',
       spikethickness: 1, spikedash: 'dot', spikecolor: muted
@@ -369,7 +390,8 @@ function render() {
       });
       stateRows.forEach((sr, row) => {
         const name = val => (sr.names && sr.names[val]) || String(val);
-        const values = [...new Set(rows.filter(r => !r._gap && r[sr.key] != null).map(r => r[sr.key]))];
+        const val = r => (r._pad ? r._src || {} : r)[sr.key];
+        const values = [...new Set(rows.filter(r => !r._pad && r[sr.key] != null).map(r => r[sr.key]))];
         // Known states first in their declared order, then anything unexpected
         const known = Object.keys(sr.colors);
         values.sort((a, b) => {
@@ -385,8 +407,8 @@ function render() {
           : values.flatMap((val, j) => [[j / n, colorOf(val)], [(j + 1) / n, colorOf(val)]]);
         traces.push({
           type: 'heatmap', x, y: [row], xaxis: 'x', yaxis,
-          z: [rows.map(r => r._gap || r[sr.key] == null ? null : idx.get(r[sr.key]))],
-          text: [rows.map(r => r._gap || r[sr.key] == null ? '' : name(r[sr.key]))],
+          z: [rows.map(r => val(r) == null ? null : idx.get(val(r)))],
+          text: [rows.map(r => val(r) == null ? '' : name(val(r)))],
           zmin: -0.5, zmax: n - 0.5, colorscale, showscale: false, xgap: 0, ygap: 2,
           hovertemplate: `%{text}<extra>${sr.name}</extra>`
         });
@@ -399,12 +421,12 @@ function render() {
     for (const sr of p.series) {
       if (!AVAILABLE.has(sr.key)) continue;
       const t = {
-        x, y: col(sr.key), name: sr.name, type: 'scattergl', mode: 'lines', xaxis: 'x', yaxis,
+        x: lineX, y: col(sr.key), name: sr.name, type: 'scattergl', mode: 'lines', xaxis: 'x', yaxis,
         line: { color: pal[sr.color], width: 2, dash: sr.dash || 'solid' },
         hovertemplate: `${sr.hover || `%{y:${sr.fmt}}${sr.unit}`}<extra>${sr.name}</extra>`
       };
       t.legend = legendId;
-      if (sr.extra) t.customdata = rows.map(r => sr.extra.map(k => r[k] ?? null));
+      if (sr.extra) t.customdata = lineRows.map(r => sr.extra.map(k => r[k] ?? null));
       // Single-series panels are named by their title; keep the legend for multi-series comparison
       if (p.series.length === 1) t.showlegend = false;
       traces.push(t);
@@ -421,6 +443,14 @@ function render() {
       });
     }
   });
+
+  // Separator between cycles, drawn on the boundary between the two samples
+  for (const b of BREAKS) {
+    shapes.push({
+      type: 'line', xref: 'x', x0: b - 0.5, x1: b - 0.5, yref: 'paper', y0: 0, y1: 1,
+      line: { color: v('--ink'), width: 1.5 }, layer: 'above'
+    });
+  }
 
   keyEl.innerHTML = keyHtml.join('');
   keyEl.hidden = !keyHtml.length;
